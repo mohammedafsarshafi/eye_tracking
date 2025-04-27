@@ -1,0 +1,155 @@
+# -*- coding: utf-8 -*-
+import cv2
+import dlib
+import numpy as np
+import os
+
+def open_webcam():
+    for index in range(5):
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            print(f"Webcam opened on index {index}!")
+            return cap
+        print(f"Camera index {index} failed.")
+    print("Error: No webcam found.")
+    exit()
+
+detector = dlib.get_frontal_face_detector()
+predictor_path = os.path.join(os.path.dirname(__file__), "models", "shape_predictor_68_face_landmarks.dat")
+
+try:
+    predictor = dlib.shape_predictor(predictor_path)
+    print("Shape predictor loaded!")
+except RuntimeError as e:
+    print(f"Error: Could not load shape predictor. Error: {e}")
+    exit()
+
+def detect_pupil(eye_region, frame_count):
+    if eye_region is None or eye_region.size == 0:
+        print(f"Frame {frame_count}: Empty eye region!")
+        return None
+    
+    if len(eye_region.shape) == 3:
+        gray_eye = cv2.cvtColor(eye_region, cv2.COLOR_BGR2GRAY)
+    else:
+        gray_eye = eye_region
+
+    gray_eye = cv2.equalizeHist(gray_eye)
+    blurred_eye = cv2.GaussianBlur(gray_eye, (5, 5), 0)
+    _, threshold_eye = cv2.threshold(blurred_eye, 40, 255, cv2.THRESH_BINARY_INV)
+    
+    cv2.imwrite(f"debug_eye_{frame_count}.png", gray_eye)
+    cv2.imwrite(f"debug_threshold_{frame_count}.png", threshold_eye)
+    
+    contours, _ = cv2.findContours(threshold_eye, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if contours:
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > 10 and area < (eye_region.shape[0] * eye_region.shape[1]) * 0.1:
+                (cx, cy), radius = cv2.minEnclosingCircle(contour)
+                contour_img = cv2.cvtColor(threshold_eye, cv2.COLOR_GRAY2BGR)
+                cv2.drawContours(contour_img, [contour], -1, (0, 255, 0), 1)
+                cv2.imwrite(f"debug_contour_{frame_count}.png", contour_img)
+                return (int(cx), int(cy))
+        print(f"Frame {frame_count}: No valid pupil contour!")
+    else:
+        print(f"Frame {frame_count}: No contours!")
+    return None
+
+def process_eye_movement(frame, frame_count):
+    if frame is None or frame.size == 0:
+        print("No frame!")
+        return frame, "No Frame"
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+    if gray.dtype != np.uint8:
+        gray = gray.astype(np.uint8)
+
+    faces = detector(gray)
+    gaze_direction = "No Gaze"
+
+    if not faces:
+        print(f"Frame {frame_count}: No faces detected!")
+        return frame, gaze_direction
+
+    face = faces[0]
+    landmarks = predictor(gray, face)
+    
+    left_eye_points = np.array([(landmarks.part(n).x, landmarks.part(n).y) for n in range(36, 42)])
+    right_eye_points = np.array([(landmarks.part(n).x, landmarks.part(n).y) for n in range(42, 48)])
+    
+    left_eye_rect = cv2.boundingRect(left_eye_points)
+    right_eye_rect = cv2.boundingRect(right_eye_points)
+    
+    padding = 5
+    left_eye = frame[max(0, left_eye_rect[1]-padding):left_eye_rect[1] + left_eye_rect[3]+padding,
+                     max(0, left_eye_rect[0]-padding):left_eye_rect[0] + left_eye_rect[2]+padding]
+    right_eye = frame[max(0, right_eye_rect[1]-padding):right_eye_rect[1] + right_eye_rect[3]+padding,
+                      max(0, right_eye_rect[0]-padding):right_eye_rect[0] + right_eye_rect[2]+padding]
+    
+    left_pupil = detect_pupil(left_eye, frame_count)
+    right_pupil = detect_pupil(right_eye, frame_count)
+    print(f"Frame {frame_count}: Left pupil: {left_pupil}, Right pupil: {right_pupil}")
+    
+    cv2.rectangle(frame, (left_eye_rect[0], left_eye_rect[1]), 
+                  (left_eye_rect[0] + left_eye_rect[2], left_eye_rect[1] + left_eye_rect[3]), (0, 255, 0), 1)
+    cv2.rectangle(frame, (right_eye_rect[0], right_eye_rect[1]), 
+                  (right_eye_rect[0] + right_eye_rect[2], right_eye_rect[1] + right_eye_rect[3]), (0, 255, 0), 1)
+    
+    if left_pupil and right_pupil:
+        lx, ly = left_pupil[0] + left_eye_rect[0] - padding, left_pupil[1] + left_eye_rect[1] - padding
+        rx, ry = right_pupil[0] + right_eye_rect[0] - padding, right_pupil[1] + right_eye_rect[1] - padding
+        
+        norm_lx = left_pupil[0] / left_eye.shape[1] if left_eye.shape[1] > 0 else 0.5
+        norm_rx = right_pupil[0] / right_eye.shape[1] if right_eye.shape[1] > 0 else 0.5
+        norm_ly = left_pupil[1] / left_eye.shape[0] if left_eye.shape[0] > 0 else 0.5
+        norm_ry = right_pupil[1] / right_eye.shape[0] if right_eye.shape[0] > 0 else 0.5
+        
+        print(f"Frame {frame_count}: Norm: Left ({norm_lx:.2f}, {norm_ly:.2f}), Right ({norm_rx:.2f}, {norm_ry:.2f})")
+        
+        if norm_lx < 0.4 and norm_rx < 0.4:
+            gaze_direction = "Left"
+        elif norm_lx > 0.6 and norm_rx > 0.6:
+            gaze_direction = "Right"
+        elif norm_ly < 0.4 and norm_ry < 0.4:
+            gaze_direction = "Up"
+        elif norm_ly > 0.6 and norm_ry > 0.6:
+            gaze_direction = "Down"
+        else:
+            gaze_direction = "Straight"
+        
+        cv2.putText(frame, f"L: ({norm_lx:.2f}, {norm_ly:.2f})", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        cv2.putText(frame, f"R: ({norm_rx:.2f}, {norm_ry:.2f})", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        cv2.circle(frame, (int(lx), int(ly)), 3, (0, 0, 255), -1)
+        cv2.circle(frame, (int(rx), int(ry)), 3, (0, 0, 255), -1)
+    
+    else:
+        eye_width, eye_height = left_eye_rect[2], left_eye_rect[3]
+        cv2.circle(frame, (left_eye_rect[0] + eye_width//2, left_eye_rect[1] + eye_height//2), 3, (0, 0, 255), -1)
+        cv2.circle(frame, (right_eye_rect[0] + eye_width//2, right_eye_rect[1] + eye_height//2), 3, (0, 0, 255), -1)
+        print(f"Frame {frame_count}: Pupil detection failed!")
+
+    return frame, gaze_direction
+
+cap = open_webcam()
+frame_count = 0
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Error: Could not read frame.")
+        continue
+    
+    frame, gaze = process_eye_movement(frame, frame_count)
+    cv2.putText(frame, f"Gaze: {gaze}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    
+    cv2.imshow("Eye Tracker", frame)
+    frame_count += 1
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
